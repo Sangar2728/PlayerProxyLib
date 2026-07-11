@@ -1,0 +1,3 @@
+displayName = Player Proxy Lib
+author = Sangar
+version = 0.1
