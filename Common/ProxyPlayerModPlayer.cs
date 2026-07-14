@@ -8,7 +8,7 @@ using Terraria.ModLoader;
 
 namespace PlayerProxyLib.Common
 {
-    public class FakePlayerModPlayer : ModPlayer
+    public class ProxyPlayerModPlayer : ModPlayer
     {
         public bool shouldBeInvisible;
         public bool isFakePlayer;

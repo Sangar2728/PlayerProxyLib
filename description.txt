@@ -1,1 +1,27 @@
-Modify this file with a description of your mod.
+PlayerProxyLib allows NPCs and Projectiles to use Terraria APIs that require a Player by providing persistent Player proxies.
+This is useful for Terraria APIs that require a Player, such as buffs, projectile ownership, damage hooks, and other player-specific mechanics, without requiring custom implementations.
+
+API:
+
+// Gets (or creates) the proxy associated with an entity.
+Player proxy = entity.GetPlayerProxy();
+
+// Synchronizes an existing proxy with the current entity state.
+entity.UpdatePlayerProxy();
+
+// Releases the proxy and its reserved player slot.
+entity.DisposePlayerProxy();
+
+// Returns whether a Player is managed by PlayerProxyLib.
+bool isProxy = player.IsProxyPlayer();
+
+Example:
+
+Player player = NPC.GetPlayerProxy();
+player.hasTitaniumStormBuff = true;
+player.AddBuff(BuffID.TitaniumStorm, 600);
+Projectile.NewProjectile(Projectile.GetSource_None(), pos, velocity, ProjectileID.TitaniumStormShard, damage, 0, player.whoAmI);
+
+
+Player proxies are persistent, automatically cleaned up when their owner becomes invalid, and reuse available player slots internally.
+Designed for mod developers. This library has no gameplay content by itself.
