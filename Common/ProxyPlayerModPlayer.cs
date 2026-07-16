@@ -1,8 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿using Terraria;
 using Terraria.DataStructures;
 using Terraria.ModLoader;
 
@@ -10,11 +6,16 @@ namespace PlayerProxyLib.Common
 {
     public class ProxyPlayerModPlayer : ModPlayer
     {
-        public bool shouldBeInvisible;
-        public bool isFakePlayer;
+        internal bool shouldBeDrawn;
+        internal bool isFakePlayer;
+        internal bool shouldBeIgnoredByNPCs;
+        internal bool shouldCountForPlayerCount;
+        internal Entity owner;
+
         public override void HideDrawLayers(PlayerDrawSet drawInfo)
         {
-            if (!shouldBeInvisible) return;
+            if (!isFakePlayer) return;
+            if (shouldBeDrawn) return;
             PlayerDrawLayers.Head.Hide();
             PlayerDrawLayers.Torso.Hide();
             PlayerDrawLayers.Leggings.Hide();

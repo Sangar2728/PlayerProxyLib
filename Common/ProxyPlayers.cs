@@ -3,6 +3,7 @@ using System.Linq;
 using Terraria;
 using Terraria.DataStructures;
 using Terraria.ID;
+using Terraria.ModLoader;
 
 namespace PlayerProxyLib.Common
 {
@@ -16,9 +17,9 @@ namespace PlayerProxyLib.Common
         /// If no proxy exists, one is created.
         /// </summary>
         /// <remarks>
-        /// The proxy remains associated with the entity until it is disposed or the entity becomes invalid.
-        /// Only the proxy identity and synchronized properties are managed by the library.
-        /// Any additional state stored in the returned <see cref="Player"/> is the consumer's responsibility.
+        /// <para>The proxy remains associated with the entity until it is disposed or the entity becomes invalid.</para>
+        /// <para>Only the proxy identity and synchronized properties are managed by the library.</para>
+        /// <para>Any additional state stored in the returned <see cref="Player"/> is the consumer's responsibility.</para>
         /// 
         /// Example:
         /// <code>
@@ -37,12 +38,12 @@ namespace PlayerProxyLib.Common
         /// <see cref="Player"/> if <paramref name="entity"/> is valid and <see cref="Main.player"/> has an available slot; otherwise <see langword="null"/>.
         /// </returns>
 
-        public static Player GetPlayerProxy(this Entity entity, bool visible = false, bool sync = true)
+        public static Player GetPlayerProxy(this Entity entity, bool sync = true)
         {
             if (entity == null || !entity.active) return null;
             if (entity is NPC npc && npc.life <= 0) return null;
 
-            if (!_players.TryGetValue(entity, out int playerwhoAmI))
+            if (!_players.TryGetValue(entity, out int playerWhoAmI))
             {
                 int index = ProxyUtils.GetAvailableWhoAmI();
                 if (index <= -1) return null;
@@ -55,20 +56,32 @@ namespace PlayerProxyLib.Common
                     whoAmI = index,
                     active = true
                 };
-                playerwhoAmI = index;
+
+                Main.player[index].GetModPlayer<ProxyPlayerModPlayer>().owner = entity;
+                playerWhoAmI = index;
             }
 
-            Player player = Main.player[playerwhoAmI];
-            if(sync) Sync(player, entity, visible);
+            Player player = Main.player[playerWhoAmI];
+            if(sync) Sync(player, entity);
 
             return player;
         }
+
         /// <summary>
         /// Refresh the sync with the <see cref="Player"/> proxy associated with the specified <paramref name="entity"/>.
         /// </summary>
-        public static void UpdatePlayerProxy(this Entity entity, bool visible = false) => GetPlayerProxy(entity, visible);
+        public static void UpdatePlayerProxy(this Entity entity) => GetPlayerProxy(entity);
 
-
+        /// <summary>
+        /// Disposes the <see cref="Player"/> proxy associated with the specified <paramref name="entity"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>Removes the association between the entity and its proxy, releases the underlying
+        /// <see cref="Main.player"/> slot, and invalidates the current proxy instance.</para>
+        /// 
+        /// <para>Calling <see cref="GetPlayerProxy(Entity, bool)"/> again for the same entity creates a new proxy.</para>
+        /// <para>Once a proxy has been disposed, it must not be referenced again.</para>
+        /// </remarks>
         public static void DisposePlayerProxy(this Entity entity)
         {
             if (!_players.TryGetValue(entity, out int playerWhoAmI)) return;
@@ -76,36 +89,49 @@ namespace PlayerProxyLib.Common
         }
 
         /// <summary>
-        /// Disposes the <see cref="Player"/> proxy associated with the specified <paramref name="entity"/>.
+        /// Check if player is a proxy
+        /// </summary>
+        /// <param name="player"></param>
+        /// <returns></returns>
+        public static bool IsProxyPlayer(this Player player) => player?.GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer ?? false;
+
+        /// <summary>
+        /// Configures multiple behaviors of the proxy player.
         /// </summary>
         /// <remarks>
-        /// Removes the association between the entity and its proxy, releases the underlying
-        /// <see cref="Main.player"/> slot, and invalidates the current proxy instance.
-        /// 
-        /// Calling <see cref="GetPlayerProxy(Entity, bool, bool)"/> again for the same entity
-        /// creates a new proxy.
+        /// If the specified <paramref name="entity"/> does not already have an associated proxy, one is created automatically.
         /// </remarks>
-        public static bool IsProxyPlayer(this Player player) => player.GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer;
+        /// <param name="entity"></param>
+        /// <param name="targetable"></param>
+        /// <param name="countForPlayerCount"></param>
+        /// <param name="shouldBeDrawn"></param>
+        public static void ConfigureProxyPlayer(this Entity entity, bool targetable = false, bool countForPlayerCount = false, bool shouldBeDrawn = false)
+        {
+            Player player = GetPlayerProxy(entity);
+            if(player == null) return;
 
-        private static void Sync(Player player, Entity entity, bool visible)
+            ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
+            modPlayer.shouldBeIgnoredByNPCs = !targetable;
+            modPlayer.shouldCountForPlayerCount = countForPlayerCount;
+            modPlayer.shouldBeDrawn = shouldBeDrawn;
+        }
+
+        private static void Sync(Player player, Entity entity)
         {
 
             bool dead = entity switch
             {
                 NPC npc => npc.life <= 0,
                 Projectile projectile => projectile.timeLeft <= 0,
-                _ => true
+                _ => false
             };
             ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
-            player.position = entity.position;
             player.Center = entity.Center;
             player.velocity = entity.velocity;
             player.direction = entity.direction;
             player.active = entity.active;
             player.dead = dead;
             modPlayer.isFakePlayer = true;
-            modPlayer.shouldBeInvisible = !visible;
-
         }
 
         internal static void GarbageCollector()
@@ -131,10 +157,10 @@ namespace PlayerProxyLib.Common
                 else if (entity is Projectile projectile)
                 {
                     bool projectileInIndex = Main.projectile.IndexInRange(entity.whoAmI);
-                    Projectile actualNPC = projectileInIndex ? Main.projectile[entity.whoAmI] : null;
-                    bool isSameNPC = ReferenceEquals(entity, actualNPC);
+                    Projectile actualProj = projectileInIndex ? Main.projectile[entity.whoAmI] : null;
+                    bool isSameProj = ReferenceEquals(entity, actualProj);
 
-                    if (projectileInIndex && isSameNPC && projectile.timeLeft > 0) continue;
+                    if (projectileInIndex && isSameProj && projectile.timeLeft > 0) continue;
                 }
                 player.Reset();
             }

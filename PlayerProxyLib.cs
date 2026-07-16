@@ -24,7 +24,7 @@ namespace PlayerProxyLib
             On_NPC.GetActivePlayerCount -= ON_GetActivePlayerCount;
         }
 
-        private void IL_TargetClosest(ILContext il)
+        /*private void IL_TargetClosest(ILContext il)
         {
             ILCursor c = new(il);
 
@@ -44,10 +44,57 @@ namespace PlayerProxyLib
 
             c.Emit(OpCodes.Ldloc_S, (byte)loopIndex);
 
+           // c.EmitDelegate(static (int index) => Main.player[index].GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer);
             c.EmitDelegate(static (int index) =>
-                Main.player[index]
-                    .GetModPlayer<ProxyPlayerModPlayer>()
-                    .isFakePlayer);
+            {
+                var player = Main.player[index];
+                ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
+
+                bool result = modPlayer.isFakePlayer && modPlayer.shouldBeIgnoredByNPCs;
+
+                return result;
+            });
+            c.Emit(OpCodes.Brtrue_S, continueLabel);
+        }*/
+
+        private void IL_TargetClosest(ILContext il)
+        {
+            ILCursor c = new(il);
+
+            int loopIndex = -1;
+            ILLabel continueLabel = null;
+
+            if (!c.TryGotoNext(
+                MoveType.After,
+                i => i.MatchLdloc(out loopIndex),
+                i => i.MatchLdelemRef(),
+                i => i.MatchLdfld<Player>(nameof(Player.ghost)),
+                i => i.MatchBrtrue(out continueLabel)))
+            {
+                Logger.Warn("PlayerProxyLib: failed to patch NPC.TargetClosest.");
+                return;
+            }
+
+            // Push:
+            // arg0 = this (NPC)
+            // local = player index
+            c.Emit(OpCodes.Ldarg_0);
+            c.Emit(OpCodes.Ldloc_S, (byte)loopIndex);
+
+            c.EmitDelegate(static (NPC npc, int index) =>
+            {
+                var modPlayer = Main.player[index].GetModPlayer<ProxyPlayerModPlayer>();
+
+                if (!modPlayer.isFakePlayer)
+                    return false;
+
+                // Never target your own proxy.
+                if (ReferenceEquals(modPlayer.owner, npc))
+                    return true;
+
+                // Optionally ignore proxies globally.
+                return modPlayer.shouldBeIgnoredByNPCs;
+            });
 
             c.Emit(OpCodes.Brtrue_S, continueLabel);
         }
@@ -58,7 +105,9 @@ namespace PlayerProxyLib
             {
                 Player player = Main.player[i];
                 if (player == null || !player.active) continue;
-                if (player.GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer) continue;
+                ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
+                if(modPlayer == null) continue;
+                if (modPlayer.isFakePlayer && !modPlayer.shouldCountForPlayerCount) continue;
                 count++;
             }
             return count > 0? count : 1;

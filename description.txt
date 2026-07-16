@@ -15,6 +15,9 @@ entity.DisposePlayerProxy();
 // Returns whether a Player is managed by PlayerProxyLib.
 bool isProxy = player.IsProxyPlayer();
 
+// Allow advanced configure for proxy
+entity.ConfigureProxyPlayer();
+
 Example:
 
 Player player = NPC.GetPlayerProxy();
