@@ -1,8 +1,10 @@
 using Mono.Cecil.Cil;
 using MonoMod.Cil;
 using PlayerProxyLib.Common;
+using System.IO;
 using Terraria;
 using Terraria.ModLoader;
+using static PlayerProxyLib.Common.ProxyUtils;
 
 namespace PlayerProxyLib
 {
@@ -23,40 +25,6 @@ namespace PlayerProxyLib
             IL_NPC.TargetClosest_WOF -= IL_TargetClosest;
             On_NPC.GetActivePlayerCount -= ON_GetActivePlayerCount;
         }
-
-        /*private void IL_TargetClosest(ILContext il)
-        {
-            ILCursor c = new(il);
-
-            int loopIndex = -1;
-            ILLabel continueLabel = null;
-
-            if (!c.TryGotoNext(
-                MoveType.After,
-                i => i.MatchLdloc(out loopIndex),
-                i => i.MatchLdelemRef(),
-                i => i.MatchLdfld<Player>(nameof(Player.ghost)),
-                i => i.MatchBrtrue(out continueLabel)))
-            {
-                Logger.Warn("PlayerProxyLib: failed to patch NPC.TargetClosest.");
-                return;
-            }
-
-            c.Emit(OpCodes.Ldloc_S, (byte)loopIndex);
-
-           // c.EmitDelegate(static (int index) => Main.player[index].GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer);
-            c.EmitDelegate(static (int index) =>
-            {
-                var player = Main.player[index];
-                ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
-
-                bool result = modPlayer.isFakePlayer && modPlayer.shouldBeIgnoredByNPCs;
-
-                return result;
-            });
-            c.Emit(OpCodes.Brtrue_S, continueLabel);
-        }*/
-
         private void IL_TargetClosest(ILContext il)
         {
             ILCursor c = new(il);
@@ -111,6 +79,22 @@ namespace PlayerProxyLib
                 count++;
             }
             return count > 0? count : 1;
+        }
+
+        public override void HandlePacket(BinaryReader reader, int whoAmI)
+        {
+            MessageType messageType = (MessageType)reader.ReadByte();
+
+            switch (messageType)
+            {
+                case MessageType.RequestProxy:
+                    ProxyPlayers.ReceiveProxyRequest(reader, whoAmI);
+                    break;
+
+                case MessageType.CreateProxy:
+                    ProxyPlayers.ReceiveProxyCreation(reader);
+                    break;
+            }
         }
 
     }

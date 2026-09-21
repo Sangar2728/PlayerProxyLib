@@ -1,9 +1,12 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using Terraria;
 using Terraria.DataStructures;
 using Terraria.ID;
 using Terraria.ModLoader;
+using static PlayerProxyLib.Common.ProxyUtils;
 
 namespace PlayerProxyLib.Common
 {
@@ -45,19 +48,20 @@ namespace PlayerProxyLib.Common
 
             if (!_players.TryGetValue(entity, out int playerWhoAmI))
             {
+                if (Main.netMode == NetmodeID.MultiplayerClient)
+                {
+                    SendProxyRequest(entity);
+                    return null;
+                }
+
                 int index = ProxyUtils.GetAvailableWhoAmI();
                 if (index <= -1) return null;
 
-                _players[entity] = index;
-                _playersOwners[index] = entity;
+                CreateProxy(entity: entity, index);
 
-                Main.player[index] = new Player()
-                {
-                    whoAmI = index,
-                    active = true
-                };
+                if (Main.netMode == NetmodeID.Server)
+                    SendProxyCreation(entity, index);
 
-                Main.player[index].GetModPlayer<ProxyPlayerModPlayer>().owner = entity;
                 playerWhoAmI = index;
             }
 
@@ -65,6 +69,136 @@ namespace PlayerProxyLib.Common
             if(sync) Sync(player, entity);
 
             return player;
+        }
+        private static void SendProxyRequest(Entity entity)
+        {
+    
+   
+            if (Main.netMode != NetmodeID.MultiplayerClient)
+                return;
+
+            ProxyEntityType entityType;
+
+            if (entity is NPC)
+                entityType = ProxyEntityType.NPC;
+            else if (entity is Projectile)
+                entityType = ProxyEntityType.Projectile;
+            else
+                return;
+
+            ModPacket packet = ModContent
+                .GetInstance<PlayerProxyLib>()
+                .GetPacket();
+
+            packet.Write((byte)MessageType.RequestProxy);
+            packet.Write((byte)entityType);
+            packet.Write((short)entity.whoAmI);
+
+            packet.Send();
+        }
+
+        private static Player CreateProxy(Entity entity, int index)
+        {
+            _players[entity] = index;
+            _playersOwners[index] = entity;
+
+            Player player = new()
+            {
+                whoAmI = index,
+                active = true
+            };
+
+            Main.player[index] = player;
+
+            player.GetModPlayer<ProxyPlayerModPlayer>().owner = entity;
+
+            return player;
+        }
+
+        private static void SendProxyCreation(Entity entity,int proxyWhoAmI,int toClient = -1)
+        {
+            if (Main.netMode != NetmodeID.Server)
+                return;
+
+            ProxyEntityType entityType;
+
+            if (entity is NPC)
+                entityType = ProxyEntityType.NPC;
+            else if (entity is Projectile)
+                entityType = ProxyEntityType.Projectile;
+            else
+                return;
+
+            ModPacket packet = ModContent
+                .GetInstance<PlayerProxyLib>()
+                .GetPacket();
+
+            packet.Write((byte)MessageType.CreateProxy);
+            packet.Write((byte)entityType);
+            packet.Write((short)entity.whoAmI);
+            packet.Write((byte)proxyWhoAmI);
+
+            packet.Send(toClient);
+        }
+
+        internal static void ReceiveProxyCreation(BinaryReader reader)
+        {
+            if (Main.netMode != NetmodeID.MultiplayerClient)
+                return;
+
+            ProxyEntityType entityType = (ProxyEntityType)reader.ReadByte();
+            int entityWhoAmI = reader.ReadInt16();
+            int proxyWhoAmI = reader.ReadByte();
+
+            Entity entity = entityType switch
+            {
+                ProxyEntityType.NPC
+                    when Main.npc.IndexInRange(entityWhoAmI)
+                    => Main.npc[entityWhoAmI],
+
+                ProxyEntityType.Projectile
+                    when Main.projectile.IndexInRange(entityWhoAmI)
+                    => Main.projectile[entityWhoAmI],
+
+                _ => null
+            };
+
+            if (entity == null || !entity.active)
+                return;
+
+            CreateProxy(entity, proxyWhoAmI);
+        }
+
+        internal static void ReceiveProxyRequest(BinaryReader reader, int fromClient)
+        {
+            if (Main.netMode != NetmodeID.Server)
+                return;
+
+            ProxyEntityType entityType = (ProxyEntityType)reader.ReadByte();
+            int entityWhoAmI = reader.ReadInt16();
+
+            Entity entity = entityType switch
+            {
+                ProxyEntityType.NPC
+                    when Main.npc.IndexInRange(entityWhoAmI)
+                    => Main.npc[entityWhoAmI],
+
+                ProxyEntityType.Projectile
+                    when Main.projectile.IndexInRange(entityWhoAmI)
+                    => Main.projectile[entityWhoAmI],
+
+                _ => null
+            };
+
+            if (entity == null || !entity.active)
+                return;
+
+            Player proxy = entity.GetPlayerProxy();
+
+            if (proxy == null)
+                return;
+
+            SendProxyCreation(entity, proxy.whoAmI, fromClient);
         }
 
         /// <summary>
