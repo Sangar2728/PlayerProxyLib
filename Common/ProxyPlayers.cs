@@ -1,9 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using Terraria;
-using Terraria.DataStructures;
 using Terraria.ID;
 using Terraria.ModLoader;
 using static PlayerProxyLib.Common.ProxyUtils;
@@ -12,325 +11,556 @@ namespace PlayerProxyLib.Common
 {
     public static class ProxyPlayers
     {
-        private static readonly Dictionary<Entity, int> _players = new(ReferenceEqualityComparer.Instance);
-        private static readonly Dictionary<int, Entity> _playersOwners = [];
+        private const ulong RequestInterval = 60;
+        private const ulong PendingLifetime = 600;
+        private const ulong GarbageCollectInterval = 30;
+
+        private readonly record struct ProxyKey(
+            ProxyEntityType Type, int Index, int EntityType, int Owner, int Identity);
+
+        private readonly record struct EntityDescriptor(
+            ProxyEntityType Type, int Index, int EntityType, int Owner, int Identity)
+        {
+            // Projectile.whoAmI may differ across peers.
+            public ProxyKey Key => Type == ProxyEntityType.Projectile
+                ? new(Type, -1, EntityType, Owner, Identity)
+                : new(Type, Index, EntityType, -1, -1);
+        }
+
+        private sealed class ProxyRecord
+        {
+            public required Entity Entity;
+            public required EntityDescriptor Descriptor;
+            public required Player Player;
+            public required int Slot;
+            public required uint Generation;
+        }
+
+        private sealed class PendingCreation
+        {
+            public required EntityDescriptor Descriptor;
+            public required int Slot;
+            public required uint Generation;
+            public required byte Options;
+            public required ulong ReceivedAt;
+        }
+
+        private static readonly Dictionary<Entity, ProxyRecord> _players = new(ReferenceEqualityComparer.Instance);
+        private static readonly Dictionary<int, ProxyRecord> _playersOwners = [];
+        private static readonly Dictionary<ProxyKey, ulong> _lastRequestAt = [];
+        private static readonly Dictionary<ProxyKey, PendingCreation> _pending = [];
+        private static readonly Dictionary<ProxyKey, uint> _latestGeneration = [];
+        private static readonly Dictionary<ProxyKey, uint> _destroyedGeneration = [];
+        private static readonly Dictionary<ProxyKey, ulong> _generationSeenAt = [];
+        private static ulong _ticks;
+        private static uint _nextGeneration;
+        private static ulong _lastSnapshotRequestAt;
+        private static bool _snapshotReceived;
 
         /// <summary>
-        /// Gets the persistent <see cref="Player"/> proxy associated with the specified <paramref name="entity"/>.
-        /// If no proxy exists, one is created.
+        /// Gets a proxy for an active NPC or Projectile. Clients return null until the server
+        /// supplies the proxy. Equipment, buffs, and other extra Player state belong to the caller.
         /// </summary>
-        /// <remarks>
-        /// <para>The proxy remains associated with the entity until it is disposed or the entity becomes invalid.</para>
-        /// <para>Only the proxy identity and synchronized properties are managed by the library.</para>
-        /// <para>Any additional state stored in the returned <see cref="Player"/> is the consumer's responsibility.</para>
-        /// 
-        /// Example:
-        /// <code>
-        /// 
-        /// Player proxy = npc.GetPlayerProxy();
-        ///
-        /// if (proxy != null)
-        /// {
-        ///     proxy.AddBuff(BuffID.TitaniumStorm, (int)Utils1.FormatTimeToTick(0, 0, 0, 6));
-        ///
-        ///     int p = Projectile.NewProjectile(Projectile.GetSource_None(), pos, velocity, ProjectileID.TitaniumStormShard, damage, 0, proxy.whoAmI);
-        /// }
-        /// </code>
-        /// </remarks>
-        /// <returns>
-        /// <see cref="Player"/> if <paramref name="entity"/> is valid and <see cref="Main.player"/> has an available slot; otherwise <see langword="null"/>.
-        /// </returns>
-
         public static Player GetPlayerProxy(this Entity entity, bool sync = true)
         {
-            if (entity == null || !entity.active) return null;
-            if (entity is NPC npc && npc.life <= 0) return null;
+            if (!IsEntityValid(entity) || !TryDescribe(entity, out EntityDescriptor descriptor))
+                return null;
 
-            if (!_players.TryGetValue(entity, out int playerWhoAmI))
+            _players.TryGetValue(entity, out ProxyRecord record);
+            if (record != null && !IsRecordValid(record))
+            {
+                ReleaseRecord(record, Main.netMode == NetmodeID.Server);
+                record = null;
+            }
+
+            if (record == null)
             {
                 if (Main.netMode == NetmodeID.MultiplayerClient)
                 {
-                    SendProxyRequest(entity);
+                    RequestProxy(descriptor);
                     return null;
                 }
 
-                int index = ProxyUtils.GetAvailableWhoAmI();
-                if (index <= -1) return null;
+                int slot = GetAvailableWhoAmI();
+                if (slot < 0)
+                    return null;
 
-                CreateProxy(entity: entity, index);
-
+                uint generation = ++_nextGeneration;
+                if (generation == 0)
+                    generation = ++_nextGeneration;
+                record = TryCreateProxy(entity, descriptor, slot, generation, 0);
+                if (record == null)
+                    return null;
                 if (Main.netMode == NetmodeID.Server)
-                    SendProxyCreation(entity, index);
-
-                playerWhoAmI = index;
+                    SendProxyCreation(record);
             }
 
-            Player player = Main.player[playerWhoAmI];
-            if(sync) Sync(player, entity);
-
-            return player;
+            if (sync)
+                Sync(record.Player, entity);
+            return record.Player;
         }
-        private static void SendProxyRequest(Entity entity)
+
+        private static bool TryDescribe(Entity entity, out EntityDescriptor descriptor)
         {
-    
-   
-            if (Main.netMode != NetmodeID.MultiplayerClient)
+            switch (entity)
+            {
+                case NPC npc:
+                    descriptor = new(ProxyEntityType.NPC, npc.whoAmI, npc.type, -1, -1);
+                    return true;
+                case Projectile projectile:
+                    descriptor = new(ProxyEntityType.Projectile, projectile.whoAmI,
+                        projectile.type, projectile.owner, projectile.identity);
+                    return true;
+                default:
+                    descriptor = default;
+                    return false;
+            }
+        }
+
+        private static bool IsEntityValid(Entity entity) => entity switch
+        {
+            NPC npc => npc.active && npc.life > 0 && Main.npc.IndexInRange(npc.whoAmI)
+                && ReferenceEquals(Main.npc[npc.whoAmI], npc),
+            Projectile projectile => projectile.active && projectile.timeLeft > 0
+                && Main.projectile.IndexInRange(projectile.whoAmI)
+                && ReferenceEquals(Main.projectile[projectile.whoAmI], projectile),
+            _ => false
+        };
+
+        private static bool MatchesProjectile(Projectile projectile, EntityDescriptor descriptor) =>
+            projectile != null && projectile.type == descriptor.EntityType
+            && projectile.owner == descriptor.Owner && projectile.identity == descriptor.Identity
+            && IsEntityValid(projectile);
+
+        private static Entity ResolveEntity(EntityDescriptor descriptor)
+        {
+            if (descriptor.Type == ProxyEntityType.NPC)
+            {
+                if (!Main.npc.IndexInRange(descriptor.Index))
+                    return null;
+                NPC npc = Main.npc[descriptor.Index];
+                return npc != null && npc.type == descriptor.EntityType && IsEntityValid(npc) ? npc : null;
+            }
+
+            if (descriptor.Type != ProxyEntityType.Projectile)
+                return null;
+
+            if (Main.projectile.IndexInRange(descriptor.Index))
+            {
+                Projectile atIndex = Main.projectile[descriptor.Index];
+                if (MatchesProjectile(atIndex, descriptor))
+                    return atIndex;
+            }
+
+            foreach (Projectile projectile in Main.projectile)
+                if (MatchesProjectile(projectile, descriptor))
+                    return projectile;
+            return null;
+        }
+
+        private static ProxyRecord TryCreateProxy(
+            Entity entity, EntityDescriptor descriptor, int slot, uint generation, byte options)
+        {
+            // The final Main.player element is Terraria's sentinel.
+            if (slot < 0 || slot >= Main.maxPlayers || slot >= Main.player.Length - 1)
+                return null;
+
+            if (_players.TryGetValue(entity, out ProxyRecord existing)
+                && existing.Generation == generation && existing.Slot == slot
+                && ReferenceEquals(Main.player[slot], existing.Player))
+            {
+                ApplyOptions(existing.Player, options);
+                return existing; // Duplicate packet: retain inventory, buffs, and flags.
+            }
+
+            if (_players.TryGetValue(entity, out existing) && existing.Generation >= generation)
+                return null;
+            if (_playersOwners.TryGetValue(slot, out ProxyRecord previous)
+                && previous.Generation >= generation)
+                return null;
+
+            if (existing != null)
+                ReleaseRecord(existing, false);
+            if (previous != null)
+                ReleaseRecord(previous, false);
+
+            // A real player always wins a slot collision.
+            if (Main.player[slot]?.active == true)
+                return null;
+
+            Player player = new() { whoAmI = slot, active = true };
+            Main.player[slot] = player;
+            ProxyPlayerModPlayer state = player.GetModPlayer<ProxyPlayerModPlayer>();
+            state.owner = entity;
+            state.isFakePlayer = true;
+            ApplyOptions(player, options);
+
+            ProxyRecord record = new()
+            {
+                Entity = entity,
+                Descriptor = descriptor,
+                Player = player,
+                Slot = slot,
+                Generation = generation
+            };
+            _players[entity] = record;
+            _playersOwners[slot] = record;
+            return record;
+        }
+
+        private static bool IsRecordValid(ProxyRecord record) =>
+            record != null && IsEntityValid(record.Entity)
+            && Main.player.IndexInRange(record.Slot)
+            && ReferenceEquals(Main.player[record.Slot], record.Player)
+            // Netplay deactivates slots without a socket. Identity and owner lifetime
+            // determine validity; losing active must not discard inventory or projectile counts.
+            && TryDescribe(record.Entity, out EntityDescriptor current)
+            && current.Key == record.Descriptor.Key;
+
+        private static void RequestProxy(EntityDescriptor descriptor)
+        {
+            ProxyKey key = descriptor.Key;
+            if (_pending.ContainsKey(key))
+                return;
+            if (_lastRequestAt.TryGetValue(key, out ulong last) && _ticks - last < RequestInterval)
                 return;
 
-            ProxyEntityType entityType;
-
-            if (entity is NPC)
-                entityType = ProxyEntityType.NPC;
-            else if (entity is Projectile)
-                entityType = ProxyEntityType.Projectile;
-            else
-                return;
-
-            ModPacket packet = ModContent
-                .GetInstance<PlayerProxyLib>()
-                .GetPacket();
-
+            _lastRequestAt[key] = _ticks;
+            ModPacket packet = ModContent.GetInstance<PlayerProxyLib>().GetPacket();
             packet.Write((byte)MessageType.RequestProxy);
-            packet.Write((byte)entityType);
-            packet.Write((short)entity.whoAmI);
-
+            WriteDescriptor(packet, descriptor);
             packet.Send();
         }
 
-        private static Player CreateProxy(Entity entity, int index)
+        private static void WriteDescriptor(BinaryWriter writer, EntityDescriptor descriptor)
         {
-            _players[entity] = index;
-            _playersOwners[index] = entity;
-
-            Player player = new()
-            {
-                whoAmI = index,
-                active = true
-            };
-
-            Main.player[index] = player;
-
-            player.GetModPlayer<ProxyPlayerModPlayer>().owner = entity;
-
-            return player;
+            writer.Write((byte)descriptor.Type);
+            writer.Write((short)descriptor.Index);
+            writer.Write(descriptor.EntityType);
+            writer.Write((short)descriptor.Owner);
+            writer.Write(descriptor.Identity);
         }
 
-        private static void SendProxyCreation(Entity entity,int proxyWhoAmI,int toClient = -1)
+        private static EntityDescriptor ReadDescriptor(BinaryReader reader) =>
+            new((ProxyEntityType)reader.ReadByte(), reader.ReadInt16(), reader.ReadInt32(),
+                reader.ReadInt16(), reader.ReadInt32());
+
+        private static byte GetOptions(Player player)
+        {
+            ProxyPlayerModPlayer state = player.GetModPlayer<ProxyPlayerModPlayer>();
+            byte options = 0;
+            if (state.shouldBeDrawn) options |= 1;
+            if (state.shouldBeIgnoredByNPCs) options |= 2;
+            if (state.shouldCountForPlayerCount) options |= 4;
+            return options;
+        }
+
+        private static void ApplyOptions(Player player, byte options)
+        {
+            ProxyPlayerModPlayer state = player.GetModPlayer<ProxyPlayerModPlayer>();
+            state.shouldBeDrawn = (options & 1) != 0;
+            state.shouldBeIgnoredByNPCs = (options & 2) != 0;
+            state.shouldCountForPlayerCount = (options & 4) != 0;
+        }
+
+        private static void SendProxyCreation(ProxyRecord record, int toClient = -1)
         {
             if (Main.netMode != NetmodeID.Server)
                 return;
-
-            ProxyEntityType entityType;
-
-            if (entity is NPC)
-                entityType = ProxyEntityType.NPC;
-            else if (entity is Projectile)
-                entityType = ProxyEntityType.Projectile;
-            else
-                return;
-
-            ModPacket packet = ModContent
-                .GetInstance<PlayerProxyLib>()
-                .GetPacket();
-
+            // Preserve the user's existing one-line GetPacket change.
+            ModPacket packet = ModContent.GetInstance<PlayerProxyLib>().GetPacket();
             packet.Write((byte)MessageType.CreateProxy);
-            packet.Write((byte)entityType);
-            packet.Write((short)entity.whoAmI);
-            packet.Write((byte)proxyWhoAmI);
-
+            WriteDescriptor(packet, record.Descriptor);
+            packet.Write((ushort)record.Slot);
+            packet.Write(record.Generation);
+            packet.Write(GetOptions(record.Player));
             packet.Send(toClient);
+        }
+
+        private static void SendProxyOptions(ProxyRecord record)
+        {
+            if (Main.netMode != NetmodeID.Server)
+                return;
+            ModPacket packet = ModContent.GetInstance<PlayerProxyLib>().GetPacket();
+            packet.Write((byte)MessageType.ConfigureProxy);
+            WriteDescriptor(packet, record.Descriptor);
+            packet.Write((ushort)record.Slot);
+            packet.Write(record.Generation);
+            packet.Write(GetOptions(record.Player));
+            packet.Send();
+        }
+
+        private static void SendProxyDestroy(ProxyRecord record)
+        {
+            if (Main.netMode != NetmodeID.Server)
+                return;
+            ModPacket packet = ModContent.GetInstance<PlayerProxyLib>().GetPacket();
+            packet.Write((byte)MessageType.DestroyProxy);
+            WriteDescriptor(packet, record.Descriptor);
+            packet.Write((ushort)record.Slot);
+            packet.Write(record.Generation);
+            packet.Send();
         }
 
         internal static void ReceiveProxyCreation(BinaryReader reader)
         {
             if (Main.netMode != NetmodeID.MultiplayerClient)
                 return;
-
-            ProxyEntityType entityType = (ProxyEntityType)reader.ReadByte();
-            int entityWhoAmI = reader.ReadInt16();
-            int proxyWhoAmI = reader.ReadByte();
-
-            Entity entity = entityType switch
-            {
-                ProxyEntityType.NPC
-                    when Main.npc.IndexInRange(entityWhoAmI)
-                    => Main.npc[entityWhoAmI],
-
-                ProxyEntityType.Projectile
-                    when Main.projectile.IndexInRange(entityWhoAmI)
-                    => Main.projectile[entityWhoAmI],
-
-                _ => null
-            };
-
-            if (entity == null || !entity.active)
+            EntityDescriptor descriptor = ReadDescriptor(reader);
+            int slot = reader.ReadUInt16();
+            uint generation = reader.ReadUInt32();
+            byte options = reader.ReadByte();
+            ProxyKey key = descriptor.Key;
+            if (_destroyedGeneration.TryGetValue(key, out uint destroyed) && generation <= destroyed)
                 return;
+            if (_latestGeneration.TryGetValue(key, out uint latest) && generation < latest)
+                return;
+            _latestGeneration[key] = generation;
+            _generationSeenAt[key] = _ticks;
+            _lastRequestAt.Remove(key);
 
-            CreateProxy(entity, proxyWhoAmI);
+            Entity entity = ResolveEntity(descriptor);
+            ProxyRecord created = entity == null ? null : TryCreateProxy(entity, descriptor, slot, generation, options);
+            if (created != null)
+            {
+                Sync(created.Player, entity);
+                _pending.Remove(key);
+                return;
+            }
+
+            // Entity replication may arrive after this packet.
+            _pending[key] = new PendingCreation
+            {
+                Descriptor = descriptor,
+                Slot = slot,
+                Generation = generation,
+                Options = options,
+                ReceivedAt = _ticks
+            };
         }
 
         internal static void ReceiveProxyRequest(BinaryReader reader, int fromClient)
         {
             if (Main.netMode != NetmodeID.Server)
                 return;
-
-            ProxyEntityType entityType = (ProxyEntityType)reader.ReadByte();
-            int entityWhoAmI = reader.ReadInt16();
-
-            Entity entity = entityType switch
-            {
-                ProxyEntityType.NPC
-                    when Main.npc.IndexInRange(entityWhoAmI)
-                    => Main.npc[entityWhoAmI],
-
-                ProxyEntityType.Projectile
-                    when Main.projectile.IndexInRange(entityWhoAmI)
-                    => Main.projectile[entityWhoAmI],
-
-                _ => null
-            };
-
-            if (entity == null || !entity.active)
+            EntityDescriptor descriptor = ReadDescriptor(reader);
+            if (fromClient < 0 || fromClient >= Main.maxPlayers
+                || Main.player[fromClient]?.active != true)
                 return;
-
-            Player proxy = entity.GetPlayerProxy();
-
-            if (proxy == null)
-                return;
-
-            SendProxyCreation(entity, proxy.whoAmI, fromClient);
+            Entity entity = ResolveEntity(descriptor);
+            if (entity != null && _players.TryGetValue(entity, out ProxyRecord record)
+                && IsRecordValid(record))
+                SendProxyCreation(record, fromClient);
+            // A client request never creates a server proxy.
         }
 
-        /// <summary>
-        /// Refresh the sync with the <see cref="Player"/> proxy associated with the specified <paramref name="entity"/>.
-        /// </summary>
+        internal static void ReceiveSnapshotRequest(int fromClient)
+        {
+            if (Main.netMode != NetmodeID.Server || fromClient < 0
+                || fromClient >= Main.maxPlayers || Main.player[fromClient]?.active != true)
+                return;
+            foreach (ProxyRecord record in _playersOwners.Values.ToArray())
+                if (IsRecordValid(record))
+                    SendProxyCreation(record, fromClient);
+            ModPacket packet = ModContent.GetInstance<PlayerProxyLib>().GetPacket();
+            packet.Write((byte)MessageType.SnapshotComplete);
+            packet.Send(fromClient);
+        }
+
+        internal static void ReceiveSnapshotComplete()
+        {
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+                _snapshotReceived = true;
+        }
+
+        internal static void ReceiveProxyOptions(BinaryReader reader)
+        {
+            if (Main.netMode != NetmodeID.MultiplayerClient)
+                return;
+            EntityDescriptor descriptor = ReadDescriptor(reader);
+            int slot = reader.ReadUInt16();
+            uint generation = reader.ReadUInt32();
+            byte options = reader.ReadByte();
+            if (_playersOwners.TryGetValue(slot, out ProxyRecord record)
+                && record.Generation == generation && record.Descriptor.Key == descriptor.Key)
+                ApplyOptions(record.Player, options);
+            else if (_pending.TryGetValue(descriptor.Key, out PendingCreation pending)
+                && pending.Generation == generation && pending.Slot == slot)
+                pending.Options = options;
+        }
+
+        internal static void ReceiveProxyDestroy(BinaryReader reader)
+        {
+            if (Main.netMode != NetmodeID.MultiplayerClient)
+                return;
+            EntityDescriptor descriptor = ReadDescriptor(reader);
+            int slot = reader.ReadUInt16();
+            uint generation = reader.ReadUInt32();
+            ProxyKey key = descriptor.Key;
+            if (!_destroyedGeneration.TryGetValue(key, out uint previous) || generation > previous)
+                _destroyedGeneration[key] = generation;
+            _generationSeenAt[key] = _ticks;
+            if (_pending.TryGetValue(key, out PendingCreation pending)
+                && pending.Generation <= generation)
+                _pending.Remove(key);
+            if (_playersOwners.TryGetValue(slot, out ProxyRecord record)
+                && record.Generation == generation && record.Descriptor.Key == key)
+                ReleaseRecord(record, false);
+        }
+
         public static void UpdatePlayerProxy(this Entity entity) => GetPlayerProxy(entity);
 
-        /// <summary>
-        /// Disposes the <see cref="Player"/> proxy associated with the specified <paramref name="entity"/>.
-        /// </summary>
-        /// <remarks>
-        /// <para>Removes the association between the entity and its proxy, releases the underlying
-        /// <see cref="Main.player"/> slot, and invalidates the current proxy instance.</para>
-        /// 
-        /// <para>Calling <see cref="GetPlayerProxy(Entity, bool)"/> again for the same entity creates a new proxy.</para>
-        /// <para>Once a proxy has been disposed, it must not be referenced again.</para>
-        /// </remarks>
         public static void DisposePlayerProxy(this Entity entity)
         {
-            if (!_players.TryGetValue(entity, out int playerWhoAmI)) return;
-            Main.player[playerWhoAmI].Reset();
+            if (entity != null && _players.TryGetValue(entity, out ProxyRecord record))
+                ReleaseRecord(record, Main.netMode == NetmodeID.Server);
         }
 
-        /// <summary>
-        /// Check if player is a proxy
-        /// </summary>
-        /// <param name="player"></param>
-        /// <returns></returns>
-        public static bool IsProxyPlayer(this Player player) => player?.GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer ?? false;
+        public static bool IsProxyPlayer(this Player player) =>
+            player?.GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer ?? false;
 
-        /// <summary>
-        /// Configures multiple behaviors of the proxy player.
-        /// </summary>
-        /// <remarks>
-        /// If the specified <paramref name="entity"/> does not already have an associated proxy, one is created automatically.
-        /// </remarks>
-        /// <param name="entity"></param>
-        /// <param name="targetable"></param>
-        /// <param name="countForPlayerCount"></param>
-        /// <param name="shouldBeDrawn"></param>
-        public static void ConfigureProxyPlayer(this Entity entity, bool targetable = false, bool countForPlayerCount = false, bool shouldBeDrawn = false)
+        public static void ConfigureProxyPlayer(this Entity entity, bool targetable = false,
+            bool countForPlayerCount = false, bool shouldBeDrawn = false)
         {
             Player player = GetPlayerProxy(entity);
-            if(player == null) return;
-
-            ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
-            modPlayer.shouldBeIgnoredByNPCs = !targetable;
-            modPlayer.shouldCountForPlayerCount = countForPlayerCount;
-            modPlayer.shouldBeDrawn = shouldBeDrawn;
+            if (player == null)
+                return;
+            byte previous = GetOptions(player);
+            ProxyPlayerModPlayer state = player.GetModPlayer<ProxyPlayerModPlayer>();
+            state.shouldBeIgnoredByNPCs = !targetable;
+            state.shouldCountForPlayerCount = countForPlayerCount;
+            state.shouldBeDrawn = shouldBeDrawn;
+            if (Main.netMode == NetmodeID.Server && previous != GetOptions(player)
+                && _players.TryGetValue(entity, out ProxyRecord record))
+                SendProxyOptions(record);
         }
 
         private static void Sync(Player player, Entity entity)
         {
-
-            bool dead = entity switch
+            player.Center = entity.Center;
+            player.velocity = entity.velocity;
+            player.direction = entity.direction;
+            player.active = entity.active;
+            player.dead = entity switch
             {
                 NPC npc => npc.life <= 0,
                 Projectile projectile => projectile.timeLeft <= 0,
                 _ => false
             };
-            ProxyPlayerModPlayer modPlayer = player.GetModPlayer<ProxyPlayerModPlayer>();
-            player.Center = entity.Center;
-            player.velocity = entity.velocity;
-            player.direction = entity.direction;
-            player.active = entity.active;
-            player.dead = dead;
-            modPlayer.isFakePlayer = true;
+            player.GetModPlayer<ProxyPlayerModPlayer>().isFakePlayer = true;
+        }
+
+        private static void ReleaseRecord(ProxyRecord record, bool notifyClients)
+        {
+            if (notifyClients)
+                SendProxyDestroy(record);
+            if (_players.TryGetValue(record.Entity, out ProxyRecord byEntity)
+                && ReferenceEquals(byEntity, record))
+                _players.Remove(record.Entity);
+            if (_playersOwners.TryGetValue(record.Slot, out ProxyRecord bySlot)
+                && ReferenceEquals(bySlot, record))
+                _playersOwners.Remove(record.Slot);
+            record.Player.active = false;
+            record.Player.dead = true;
+            // Do not clear a real player or newer proxy that replaced this object.
+            if (Main.player.IndexInRange(record.Slot)
+                && ReferenceEquals(Main.player[record.Slot], record.Player))
+                Main.player[record.Slot] = new Player { whoAmI = record.Slot, active = false };
+        }
+
+        // Netplay.UpdateConnectedClients clears active for slots without a real client.
+        // Restore proxies before Player.Update rebuilds ownedProjectileCounts and before
+        // NPC AI reads their state. Keep the existing Player and its owner slot.
+        internal static void PreparePlayers()
+        {
+            foreach (ProxyRecord record in _playersOwners.Values.ToArray())
+            {
+                if (IsRecordValid(record))
+                    record.Player.active = true;
+                else
+                    ReleaseRecord(record, Main.netMode == NetmodeID.Server);
+            }
+        }
+
+        internal static bool IsSlotReserved(int slot) => _playersOwners.ContainsKey(slot);
+
+        internal static void Tick()
+        {
+            _ticks++;
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+            {
+                if (!_snapshotReceived
+                    && (_lastSnapshotRequestAt == 0 || _ticks - _lastSnapshotRequestAt >= PendingLifetime)
+                    && Main.myPlayer >= 0 && Main.myPlayer < Main.maxPlayers
+                    && Main.player[Main.myPlayer]?.active == true)
+                {
+                    ModPacket packet = ModContent.GetInstance<PlayerProxyLib>().GetPacket();
+                    packet.Write((byte)MessageType.RequestSnapshot);
+                    packet.Send();
+                    _lastSnapshotRequestAt = _ticks;
+                }
+                foreach (KeyValuePair<ProxyKey, PendingCreation> pair in _pending.ToArray())
+                {
+                    PendingCreation pending = pair.Value;
+                    if (_ticks - pending.ReceivedAt > PendingLifetime)
+                    {
+                        _pending.Remove(pair.Key);
+                        continue;
+                    }
+                    Entity entity = ResolveEntity(pending.Descriptor);
+                    if (entity == null)
+                        continue;
+                    ProxyRecord created = TryCreateProxy(entity, pending.Descriptor, pending.Slot,
+                        pending.Generation, pending.Options);
+                    if (created != null)
+                    {
+                        Sync(created.Player, entity);
+                        _pending.Remove(pair.Key);
+                    }
+                }
+                foreach (KeyValuePair<ProxyKey, ulong> pair in _lastRequestAt.ToArray())
+                    if (_ticks - pair.Value > PendingLifetime)
+                        _lastRequestAt.Remove(pair.Key);
+                if (_ticks % PendingLifetime == 0)
+                {
+                    foreach (KeyValuePair<ProxyKey, ulong> pair in _generationSeenAt.ToArray())
+                    {
+                        if (_ticks - pair.Value <= PendingLifetime * 6
+                            || _pending.ContainsKey(pair.Key)
+                            || _playersOwners.Values.Any(record => record.Descriptor.Key == pair.Key))
+                            continue;
+                        _generationSeenAt.Remove(pair.Key);
+                        _latestGeneration.Remove(pair.Key);
+                        _destroyedGeneration.Remove(pair.Key);
+                    }
+                }
+            }
+            if (_ticks % GarbageCollectInterval == 0)
+                GarbageCollector();
         }
 
         internal static void GarbageCollector()
         {
-            if (_players.Count == 0) return;
-            foreach (Player player in Main.player)
-            {
-                if (player == null || !player.active) continue;
-                if (!player.IsProxyPlayer()) continue;
-
-                Entity entity = GetEntityByPlayer(player.whoAmI);
-                if (entity == null) continue;
-
-
-                if (entity is NPC npc)
-                {
-                    bool npcInIndex = Main.npc.IndexInRange(entity.whoAmI);
-                    NPC actualNPC = npcInIndex ? Main.npc[entity.whoAmI] : null;
-                    bool isSameNPC = ReferenceEquals(entity, actualNPC);
-
-                    if (npcInIndex && isSameNPC && npc.life > 0) continue;
-                }
-                else if (entity is Projectile projectile)
-                {
-                    bool projectileInIndex = Main.projectile.IndexInRange(entity.whoAmI);
-                    Projectile actualProj = projectileInIndex ? Main.projectile[entity.whoAmI] : null;
-                    bool isSameProj = ReferenceEquals(entity, actualProj);
-
-                    if (projectileInIndex && isSameProj && projectile.timeLeft > 0) continue;
-                }
-                player.Reset();
-            }
-        }
-
-
-
-        private static void Reset(this Player player)
-        {
-            int whoAmI = player.whoAmI;
-            Entity entity = GetEntityByPlayer(whoAmI);
-
-            Main.player[whoAmI] = new Player()
-            {
-                whoAmI = whoAmI,
-                active = false
-            };
-
-            _playersOwners.Remove(player.whoAmI);
-            if (entity != null) _players.Remove(entity);
+            foreach (ProxyRecord record in _playersOwners.Values.ToArray())
+                if (!IsRecordValid(record))
+                    ReleaseRecord(record, Main.netMode == NetmodeID.Server);
         }
 
         internal static void ClearDictionaries()
         {
-            foreach (int playerWhoAmI in _playersOwners.Keys)
-            {
-                if (Main.player.IndexInRange(playerWhoAmI) && Main.player[playerWhoAmI] != null)
-                {
-                    Main.player[playerWhoAmI].active = false;
-                }
-            }
+            foreach (ProxyRecord record in _playersOwners.Values.ToArray())
+                ReleaseRecord(record, false);
             _players.Clear();
             _playersOwners.Clear();
+            _lastRequestAt.Clear();
+            _pending.Clear();
+            _latestGeneration.Clear();
+            _destroyedGeneration.Clear();
+            _generationSeenAt.Clear();
+            _ticks = 0;
+            _nextGeneration = 0;
+            _lastSnapshotRequestAt = 0;
+            _snapshotReceived = false;
         }
-
-        private static Entity GetEntityByPlayer(int whoAmI) => _playersOwners.GetValueOrDefault(whoAmI);
     }
 }
-

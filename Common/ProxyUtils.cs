@@ -7,13 +7,15 @@ namespace PlayerProxyLib.Common
     {
         internal static int GetAvailableWhoAmI()
         {
-            //Scurity buffer for multiplayer
-            // average ammount of player on servers is <= 5
+            // Keep the usual low real-player indices free. This is not a formal
+            // reservation; TryCreateProxy still validates every slot before use.
             int reservedSpaceForRealPlayers = Main.netMode == NetmodeID.SinglePlayer ? 0 : 5;
 
-            for (int i = Main.player.Length - 2; i >= reservedSpaceForRealPlayers; i--)
+            for (int i = System.Math.Min(Main.maxPlayers - 1, Main.player.Length - 2);
+                i >= reservedSpaceForRealPlayers; i--)
             {
-                if (!Main.player[i].active) return i;
+                if (Main.player[i]?.active != true && !ProxyPlayers.IsSlotReserved(i))
+                    return i;
             }
             return -1;
         }
@@ -21,7 +23,11 @@ namespace PlayerProxyLib.Common
         internal enum MessageType : byte
         {
             CreateProxy,
-            RequestProxy
+            RequestProxy,
+            DestroyProxy,
+            RequestSnapshot,
+            ConfigureProxy,
+            SnapshotComplete
         }
 
         internal enum ProxyEntityType : byte

@@ -94,6 +94,18 @@ namespace PlayerProxyLib
                 case MessageType.CreateProxy:
                     ProxyPlayers.ReceiveProxyCreation(reader);
                     break;
+                case MessageType.DestroyProxy:
+                    ProxyPlayers.ReceiveProxyDestroy(reader);
+                    break;
+                case MessageType.RequestSnapshot:
+                    ProxyPlayers.ReceiveSnapshotRequest(whoAmI);
+                    break;
+                case MessageType.ConfigureProxy:
+                    ProxyPlayers.ReceiveProxyOptions(reader);
+                    break;
+                case MessageType.SnapshotComplete:
+                    ProxyPlayers.ReceiveSnapshotComplete();
+                    break;
             }
         }
 
