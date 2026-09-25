@@ -1,4 +1,5 @@
-﻿using Terraria;
+﻿using Microsoft.Xna.Framework;
+using Terraria;
 using Terraria.DataStructures;
 using Terraria.ModLoader;
 
@@ -10,6 +11,7 @@ namespace PlayerProxyLib.Common
         internal bool isFakePlayer;
         internal bool shouldBeIgnoredByNPCs;
         internal bool shouldCountForPlayerCount;
+        internal Vector2 mouseWorld;
         internal Entity owner;
 
         public override void HideDrawLayers(PlayerDrawSet drawInfo)

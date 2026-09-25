@@ -1,4 +1,4 @@
-using System;
+using Microsoft.Xna.Framework;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -434,7 +434,14 @@ namespace PlayerProxyLib.Common
                 && _players.TryGetValue(entity, out ProxyRecord record))
                 SendProxyOptions(record);
         }
-
+        public static Vector2 GetMouseWorld(this Player player)
+        {
+           return player.GetModPlayer<ProxyPlayerModPlayer>().mouseWorld;
+        }
+        public static void SetMouseWorld(this Player player, Vector2 mousePos)
+        {
+           player.GetModPlayer<ProxyPlayerModPlayer>().mouseWorld = mousePos;
+        }
         private static void Sync(Player player, Entity entity)
         {
             player.Center = entity.Center;
