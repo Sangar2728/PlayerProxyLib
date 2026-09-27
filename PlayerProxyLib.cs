@@ -15,6 +15,7 @@ namespace PlayerProxyLib
             IL_NPC.TargetClosest += IL_TargetClosest;
             IL_NPC.TargetClosest_WOF += IL_TargetClosest;
             On_NPC.GetActivePlayerCount += ON_GetActivePlayerCount;
+            On_Projectile.NewProjectile_IEntitySource_float_float_float_float_int_int_float_int_float_float_float += On_NewProjectile;
             base.Load();
         }
 
@@ -24,6 +25,8 @@ namespace PlayerProxyLib
             IL_NPC.TargetClosest -= IL_TargetClosest;
             IL_NPC.TargetClosest_WOF -= IL_TargetClosest;
             On_NPC.GetActivePlayerCount -= ON_GetActivePlayerCount;
+            On_Projectile.NewProjectile_IEntitySource_float_float_float_float_int_int_float_int_float_float_float -= On_NewProjectile;
+            base.Unload();
         }
         private void IL_TargetClosest(ILContext il)
         {
@@ -109,5 +112,28 @@ namespace PlayerProxyLib
             }
         }
 
+        private static int On_NewProjectile(On_Projectile.orig_NewProjectile_IEntitySource_float_float_float_float_int_int_float_int_float_float_float orig, Terraria.DataStructures.IEntitySource source, float x, float y, float speedX, float speedY, int type, int damage, float knockback, int owner, float ai0, float ai1, float ai2)
+        {
+            // Projectile normal: no tocar nada.
+            if (owner < 0 ||  owner >= Main.maxPlayers || Main.player[owner] == null || !Main.player[owner].IsProxyPlayer() || owner == Main.myPlayer)
+            {
+                return orig(source, x, y, speedX, speedY, type, damage, knockback, owner, ai0, ai1, ai2);
+            }
+
+            int previousMyPlayer = Main.myPlayer;
+
+            try
+            {
+                // Durante NewProjectile hacemos que la lógica vanilla
+                // considere al proxy como el propietario local.
+                Main.myPlayer = owner;
+
+                return orig(source, x, y, speedX, speedY, type, damage, knockback, owner, ai0, ai1, ai2);
+            }
+            finally
+            {
+                Main.myPlayer = previousMyPlayer;
+            }
+        }
     }
 }
