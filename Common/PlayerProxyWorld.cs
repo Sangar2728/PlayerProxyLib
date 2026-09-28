@@ -1,22 +1,23 @@
-using PlayerProxyLib.Common;
+using PlayerProxyLib.Common.NetWorking;
+using PlayerProxyLib.Common.ProxyPlayer;
 using Terraria.ModLoader;
 
 public class PlayerProxyWorld : ModSystem
 {
     public override void PreUpdatePlayers()
     {
-        ProxyPlayers.PreparePlayers();
+        ProxyPlayerManager.PreparePlayers();
     }
 
     public override void PostUpdateTime()
     {
-        ProxyPlayers.Tick();
+        ProxyPlayerManager.Tick();
         base.PostUpdateTime();
     }
 
     public override void OnWorldUnload()
     {
-        ProxyPlayers.ClearDictionaries();
+        ProxyPlayerManager.ClearDictionaries();
         base.OnWorldUnload();
     }
 }
