@@ -7,6 +7,7 @@ using PlayerProxyLib.Common.ProxyPlayer;
 using PlayerProxyLib.Common.Structs;
 using System.IO;
 using Terraria;
+using Terraria.ID;
 using Terraria.ModLoader;
 using static PlayerProxyLib.Common.ProxyUtils;
 
@@ -21,6 +22,8 @@ namespace PlayerProxyLib
             On_NPC.GetActivePlayerCount += ON_GetActivePlayerCount;
             On_Player.ItemCheck += Player_ItemCheck;
             On_Projectile.AI += Projectile_AI;
+            On_Projectile.NewProjectile_IEntitySource_float_float_float_float_int_int_float_int_float_float_float += On_NewProjectile;
+
             base.Load();
         }
 
@@ -32,6 +35,8 @@ namespace PlayerProxyLib
             On_NPC.GetActivePlayerCount -= ON_GetActivePlayerCount;
             On_Player.ItemCheck -= Player_ItemCheck;
             On_Projectile.AI -= Projectile_AI;
+            On_Projectile.NewProjectile_IEntitySource_float_float_float_float_int_int_float_int_float_float_float -= On_NewProjectile;
+
             base.Unload();
         }
         private void IL_TargetClosest(ILContext il)
@@ -117,15 +122,35 @@ namespace PlayerProxyLib
                     break;
             }
         }
+    
+        private static int On_NewProjectile(On_Projectile.orig_NewProjectile_IEntitySource_float_float_float_float_int_int_float_int_float_float_float orig, 
+            Terraria.DataStructures.IEntitySource source, float x, float y, float speedX, float speedY, int type, int damage, float knockback, int owner, float ai0, float ai1, float ai2)
+        {
+            using var context = new ProxyContextScope(owner);
+
+            return orig(source, x, y, speedX, speedY, type, damage, knockback, owner, ai0, ai1, ai2);
+        }
 
         private static void Player_ItemCheck(On_Player.orig_ItemCheck orig, Player self)
         {
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+            {
+                orig(self);
+                return;
+            }
+
             using var context = new ProxyContextScope(self.whoAmI, virtualizePvpTargets: true);
             orig(self);
         }
 
         private static void Projectile_AI(On_Projectile.orig_AI orig, Projectile self)
         {
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+            {
+                orig(self);
+                return;
+            }
+
             using var context = new ProxyContextScope(self.owner);
 
             orig(self);

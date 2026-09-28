@@ -45,8 +45,8 @@ namespace PlayerProxyLib.Common.NetWorking
             public required ulong ReceivedAt;
         }
 
-        public static readonly Dictionary<Entity, ProxyRecord> _players = new(ReferenceEqualityComparer.Instance);
-        public static readonly Dictionary<int, ProxyRecord> _playersOwners = [];
+        internal static readonly Dictionary<Entity, ProxyRecord> _players = new(ReferenceEqualityComparer.Instance);
+        internal static readonly Dictionary<int, ProxyRecord> _playersOwners = [];
         private static readonly Dictionary<ProxyKey, ulong> _lastRequestAt = [];
         private static readonly Dictionary<ProxyKey, PendingCreation> _pending = [];
         private static readonly Dictionary<ProxyKey, uint> _latestGeneration = [];
